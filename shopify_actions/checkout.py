@@ -36,6 +36,12 @@ class BuyerInfo:
     country: str = ""
     zip: str = ""
     phone: str = ""
+    # Wednesday custom-mug choices. Not checkout address fields, and not sent for other products.
+    text_position: str = ""
+    mug_message: str = ""
+    left_handed_handle: str = ""
+    additional_information: str = ""
+    agree_wait_time: bool = False
 
     @classmethod
     def from_env(cls, env: Optional[Mapping[str, str]] = None) -> "BuyerInfo":
@@ -69,6 +75,23 @@ class BuyerInfo:
                     return str(v).strip()
             return ""
 
+        wednesday = data.get("wednesday")
+        if not isinstance(wednesday, Mapping):
+            wednesday = {}
+
+        def wg(*keys: str) -> str:
+            for key in keys:
+                value = wednesday.get(key)
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+            return ""
+
+        agree_raw = wednesday.get("agree_wait_time", False)
+        if isinstance(agree_raw, str):
+            agree = agree_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            agree = bool(agree_raw)
+
         return cls(
             email=g("email"),
             first_name=g("first_name", "firstName"),
@@ -80,6 +103,11 @@ class BuyerInfo:
             country=g("country"),
             zip=g("zip", "postal_code", "postcode"),
             phone=g("phone"),
+            text_position=wg("text_position"),
+            mug_message=wg("message", "mug_message"),
+            left_handed_handle=wg("left_handed_handle"),
+            additional_information=wg("additional_information"),
+            agree_wait_time=agree,
         )
 
     def as_query_params(self) -> dict[str, str]:
@@ -101,6 +129,57 @@ class BuyerInfo:
             if value:
                 params[f"checkout[shipping_address][{key}]"] = value
         return params
+
+
+# BSS Product Options writes each line-item property as a leading space plus label_on_cart.
+# This shop does not define bssFixSupportCustomAttribute, so the space is part of the name.
+_BSS_PROPERTY_PREFIX = " "
+
+# Swatch values from the custom-mug option set (option id 553537). Internal double spaces are significant.
+WEDNESDAY_TEXT_POSITIONS = {
+    "Small text underside (max  30 characters)": "your custom message",
+    "Small text exterior bottom rim (max  25 characters)": "Your custom message ",
+    "Large uppercase text inside (max 8 characters 4 per word)": "Your chosen message",
+    "Small text inside (max 48 characters)": "your chosen message ",
+}
+WEDNESDAY_WAIT_LABEL = "Custom mugs take 8 weeks to make"
+WEDNESDAY_WAIT_VALUE = (
+    "I agree to the wait time. I have adhered to the rules with my text request. "
+)
+WEDNESDAY_HANDLE_LABEL = "Left handed handle?"
+WEDNESDAY_HANDLE_VALUES = ("No", "Yes")
+WEDNESDAY_EXTRA_LABEL = "Add any additional information here"
+
+
+def wednesday_cart_properties(buyer: BuyerInfo) -> tuple[dict[str, str], list[str]]:
+    """Line-item properties for a Wednesday custom mug.
+
+    Returns ({}, missing field names) until text position, message, handle, and the
+    wait-time agreement are all present. Nothing personal is invented.
+    """
+    missing: list[str] = []
+    position = buyer.text_position
+    if position not in WEDNESDAY_TEXT_POSITIONS:
+        missing.append("text_position")
+    if not buyer.mug_message:
+        missing.append("message")
+    if buyer.left_handed_handle not in WEDNESDAY_HANDLE_VALUES:
+        missing.append("left_handed_handle")
+    if not buyer.agree_wait_time:
+        missing.append("agree_wait_time")
+    if missing:
+        return {}, missing
+
+    message_label = WEDNESDAY_TEXT_POSITIONS[position]
+    properties = {
+        f"{_BSS_PROPERTY_PREFIX}Text position": position,
+        f"{_BSS_PROPERTY_PREFIX}{message_label}": buyer.mug_message,
+        f"{_BSS_PROPERTY_PREFIX}{WEDNESDAY_WAIT_LABEL}": WEDNESDAY_WAIT_VALUE,
+        f"{_BSS_PROPERTY_PREFIX}{WEDNESDAY_HANDLE_LABEL}": buyer.left_handed_handle,
+    }
+    if buyer.additional_information:
+        properties[f"{_BSS_PROPERTY_PREFIX}{WEDNESDAY_EXTRA_LABEL}"] = buyer.additional_information
+    return properties, []
 
 
 @dataclass(frozen=True)
@@ -258,6 +337,21 @@ def resolve_product(
     )
 
 
+def _unfetched_variant(product_url: str, variant_id: int, shop_origin: str) -> ResolvedVariant:
+    origin = shop_origin or os.environ.get("SHOPIFY_SHOP_ORIGIN", "")
+    origin, handle = parse_product_ref(product_url, default_origin=origin)
+    return ResolvedVariant(
+        product_id=0,
+        product_title=handle,
+        handle=handle,
+        variant_id=variant_id,
+        variant_title="",
+        available=False,
+        price="",
+        product_url=f"{origin}/products/{handle}",
+    )
+
+
 def _format_price(raw: Any) -> str:
     """Shopify .js prices are often integer cents as string/int."""
     if raw is None:
@@ -277,6 +371,7 @@ def build_cart_permalink(
     quantity: int = 1,
     *,
     buyer: Optional[BuyerInfo] = None,
+    properties: Optional[Mapping[str, str]] = None,
     discount: str = "",
     shop_pay: bool = False,
     storefront_cart: bool = False,
@@ -287,6 +382,12 @@ def build_cart_permalink(
     params: dict[str, str] = {}
     if buyer:
         params.update(buyer.as_query_params())
+    if properties:
+        for key, value in properties.items():
+            name = str(key)
+            text = "" if value is None else str(value)
+            if name and text:
+                params[f"properties[{name}]"] = text
     if discount:
         params["discount"] = discount
     if shop_pay:
@@ -295,7 +396,8 @@ def build_cart_permalink(
         params["storefront"] = "true"
     if not params:
         return base
-    return f"{base}?{urllib.parse.urlencode(params)}"
+    # quote keeps a trailing space as %20. quote_plus would leave a trailing + that some servers drop.
+    return f"{base}?{urllib.parse.urlencode(params, quote_via=urllib.parse.quote)}"
 
 
 def open_checkout(
@@ -304,6 +406,7 @@ def open_checkout(
     quantity: int = 1,
     variant_id: Optional[int] = None,
     buyer: Optional[BuyerInfo] = None,
+    properties: Optional[Mapping[str, str]] = None,
     shop_origin: str = "",
     open_browser: bool = True,
     require_available: bool = False,
@@ -316,25 +419,34 @@ def open_checkout(
     """
     Resolve product_url → variant, build cart permalink, optionally open browser.
 
+    A supplied variant_id skips the product fetch unless require_available=True;
+    availability is then unverified and reported as False.
+
     Stops at Shopify checkout / payment / MFA — does not submit payment.
     """
     warnings: list[str] = []
     try:
-        resolved = resolve_product(
-            product_url,
-            variant_id=variant_id,
-            shop_origin=shop_origin,
-            prefer_available=prefer_available,
-            timeout_s=timeout_s,
-        )
-        if require_available and not resolved.available:
-            raise CheckoutError(
-                f"Variant {resolved.variant_id} for {resolved.handle!r} is not available"
-            )
-        if not resolved.available:
+        if variant_id is not None and not require_available:
+            resolved = _unfetched_variant(product_url, int(variant_id), shop_origin)
             warnings.append(
-                "Selected variant reports available=false; checkout may show sold out"
+                "variant_id supplied; product not fetched, availability not verified"
             )
+        else:
+            resolved = resolve_product(
+                product_url,
+                variant_id=variant_id,
+                shop_origin=shop_origin,
+                prefer_available=prefer_available,
+                timeout_s=timeout_s,
+            )
+            if require_available and not resolved.available:
+                raise CheckoutError(
+                    f"Variant {resolved.variant_id} for {resolved.handle!r} is not available"
+                )
+            if not resolved.available:
+                warnings.append(
+                    "Selected variant reports available=false; checkout may show sold out"
+                )
 
         origin, _ = parse_product_ref(
             resolved.product_url,
@@ -346,6 +458,7 @@ def open_checkout(
             resolved.variant_id,
             quantity,
             buyer=effective_buyer,
+            properties=properties,
             discount=discount,
             shop_pay=shop_pay,
         )
